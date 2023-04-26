@@ -6,4 +6,4 @@ We have implemented the L-TAGE predictor and improved it for better prediction i
 # References
 1. [The L-TAGE paper](https://www.irisa.fr/caps/people/seznec/L-TAGE.pdf)
 2. The author's submission in CBP2. The code can be found [here](https://team.inria.fr/pacap/members/andre-seznec/branch-prediction-research/)
-3. A champsim implementation that can be found [here](https://github.com/KanPard005/RISCY_V_TAGE/blob/master/branch/ltage.bpred)
+3. A champsim implementation that can be found [here](https://github.com/KanPard005/RISCY_V_TAGE)
