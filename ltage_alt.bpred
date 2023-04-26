@@ -1,0 +1,645 @@
+#include "ooo_cpu.h"
+#include <bitset>
+
+// Base Bimodal Predictor Parameters
+#define BIMODAL_TABLE_SIZE 16384
+#define BIMODAL_PRIME 16381
+
+// TAGE Predictor Parameters
+#define GLOBAL_HISTORY_LENGTH 2048
+#define PATH_HISTORY_LENGTH 16
+#define MINIMUM_HISTORY_LENGTH 4
+#define HISTORY_ALPHA 2
+#define MAX_TAG_SIZE 16
+#define MAX_INDEX_BITS 16
+#define NUM_COMPONENTS 13
+#define CTR_BITS 6
+#define U_BITS 3
+#define RESET_U_BITS 256000
+
+// Loop Predictor Parameters
+#define LOOP_TABLE_SIZE 512
+#define LOG_LOOP_TABLE_SIZE 9
+#define LOOP_WAY 4
+#define LOG_LOOP_WAY 2
+#define LOOP_ITER_SIZE 14
+#define LOOP_TAG_SIZE 14
+#define LOOP_AGE_BITS 7
+#define LOOP_MAX_AGE 127
+#define LOOP_CONFIDENCE_BITS 1
+#define LOOP_MAX_CONFIDENCE 1
+#define MAX_LOOP_ITER 10
+
+// L-TAGE Predictor Constants
+#define WITHLOOP_BITS 5
+
+
+const uint8_t INDEX_BITS[NUM_COMPONENTS] = {10, 10, 11, 11, 11, 10, 10, 10, 10, 11,11, 12,12};
+const uint8_t TAG_BITS[NUM_COMPONENTS] = {7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 15, 16};	
+
+// One entry in the tage predictor table
+struct tage_table_entry
+{
+    bitset<CTR_BITS> ctr;
+    bitset<MAX_TAG_SIZE> tag;
+    bitset<U_BITS> u;
+
+    // Constructor
+    tage_table_entry()
+    {
+        ctr = bitset<CTR_BITS>(1 << (CTR_BITS - 1)); // weakly taken
+        u = bitset<U_BITS>(0);  // not useful
+        tag = bitset<MAX_TAG_SIZE>(0);
+    }
+};
+
+// One entry in the loop predictor table
+struct loop_table_entry
+{
+    bitset<LOOP_TAG_SIZE> tag;
+    bitset<LOOP_ITER_SIZE> past_iter;
+    bitset<LOOP_ITER_SIZE> current_iter;
+    bitset<LOOP_AGE_BITS> age;
+    bitset<LOOP_CONFIDENCE_BITS> confidence;
+    bitset<1> pred;
+};
+
+class TAGE_PREDICTOR
+{
+    public:
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    //BASE BIMODAL PREDICTOR
+    bitset<2> bimodal_table[BIMODAL_TABLE_SIZE];
+    
+    void bimodal_init()
+    {
+        for(int i = 0; i < BIMODAL_TABLE_SIZE; i++){
+            bimodal_table[i] = bitset<2>(2);
+        }
+    }
+    
+    // hashing into the bimodal table
+    uint64_t bimodal_hash(uint64_t ip)
+    {
+        return ip % BIMODAL_PRIME;
+    }
+    
+    
+    // predicting the branch
+    bool bimodal_predict_branch(uint64_t ip)
+    {
+        uint64_t hash = bimodal_hash(ip);
+        bool prediction = (bimodal_table[hash][1] == 1) ? 1 : 0;
+
+        return prediction;
+    }
+    
+    // updating the branch
+    void bimodal_last_branch_result(uint64_t ip, uint8_t taken)
+    {
+        uint64_t hash = bimodal_hash(ip);
+
+        // Conversion from bitset to int
+        uint64_t bit_value = bimodal_table[hash].to_ulong();
+
+        if (taken && (bit_value < 3))
+            bimodal_table[hash] = bitset<2>(bit_value + 1);
+        else if ((taken == 0) && (bit_value > 0))
+            bimodal_table[hash] = bitset<2>(bit_value - 1); 
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // TAGE PREDICTOR
+    bitset<GLOBAL_HISTORY_LENGTH> branch_history_vector;
+    int branches, big_ctr;
+    uint8_t final_pred, pred, alt_pred, use_alt_on_na;
+    tage_table_entry predictor_table[NUM_COMPONENTS][(1 << MAX_INDEX_BITS)];
+    int pred_comp, alt_comp;
+    bitset<PATH_HISTORY_LENGTH> path_history;
+    uint64_t history_lengths[NUM_COMPONENTS];
+    uint8_t final_tage_pred;
+
+    void tage_init()
+    {
+        use_alt_on_na = 8;
+        final_pred = 0;
+        branches = 0;
+        int a = 1;
+        for (int i = 0; i < NUM_COMPONENTS; i++)
+        {
+            history_lengths[i] = int(MINIMUM_HISTORY_LENGTH*a + 0.5);
+            a *= HISTORY_ALPHA;
+        }
+        // for (int i = 0; i < NUM_COMPONENTS; i++)
+        // {
+        //     for (int j = 0; j < (1 << INDEX_BITS[i]); j++)
+        //     {
+        //         predictor_table[i][j].ctr = bitset<CTR_BITS>(1 << (CTR_BITS - 1)); // weakly taken
+        //         predictor_table[i][j].u = bitset<U_BITS>(0);  // not useful
+        //         predictor_table[i][j].tag = bitset<MAX_TAG_SIZE>(0);
+        //     }
+        // }
+    }
+    uint64_t get_path_history_hash(int component)
+    {
+        uint64_t A = 0, A1, A2;
+        
+        for (int i = PATH_HISTORY_LENGTH - 1; i >= 0; i--)
+            A = (A << 1) | path_history[i]; 
+
+        A = A & ((1 << (history_lengths[component-1] > 16 ? 16 : history_lengths[component-1])) - 1);
+        A1 = A & ((1 << INDEX_BITS[component-1]) - 1); 
+        A2 = A >> INDEX_BITS[component-1]; 
+
+        A2 = ((A2 << component) & ((1 << INDEX_BITS[component-1]) - 1)) + (A2 >> abs(INDEX_BITS[component-1] - component));
+        A = A1 ^ A2;
+        A = ((A << component) & ((1 << INDEX_BITS[component-1]) - 1)) + (A >> abs(INDEX_BITS[component-1] - component));
+        
+        return A;
+    }
+
+    uint16_t tage_hash(uint64_t ip, int component)
+    {
+        uint64_t path_history_hash = get_path_history_hash(component);
+        uint64_t global_history_hash = comp_g_hist(history_lengths[component-1], INDEX_BITS[component-1]);
+
+        return (global_history_hash ^ ip ^ (ip >> (abs(INDEX_BITS[component-1] - component) + 1)) ^ path_history_hash) & ((1 << INDEX_BITS[component-1]) - 1);
+    }
+    uint64_t comp_g_hist(int inSize, int outSize)
+    {
+        uint64_t compressed_hist = 0; 
+        for(int i = 0; i < inSize; i++)
+        {
+            compressed_hist = (compressed_hist << 1) ^ branch_history_vector[i & (GLOBAL_HISTORY_LENGTH - 1)];
+            compressed_hist ^= branch_history_vector[(i + inSize) & (GLOBAL_HISTORY_LENGTH - 1)] << (inSize % outSize);
+            compressed_hist ^= (compressed_hist >> outSize);
+            compressed_hist = (compressed_hist) & ((1 << outSize) - 1);
+        }
+        return compressed_hist;
+    }
+    
+    uint16_t get_tag(uint64_t ip, int comp)
+    {
+        // Returns the tag for the given component
+        uint64_t global_history_hash = comp_g_hist(history_lengths[comp-1], TAG_BITS[comp-1])^comp_g_hist(history_lengths[comp-1], TAG_BITS[comp-1] - 1);
+        return (global_history_hash ^ ip) & ((1 << TAG_BITS[comp-1]) - 1);
+    }
+
+    void match_component(uint64_t ip, int &i1, int &i2)
+    {
+        i1 = 0, i2 = 0;
+        int comp, idx = 0;
+        for(comp = NUM_COMPONENTS; comp > 0; comp--)
+        {
+            uint16_t index = tage_hash(ip, comp);
+            uint16_t tag = get_tag(ip, comp);  
+            if (tag == 0){
+                return;
+            }
+            if(predictor_table[comp-1][index].tag == tag)
+            {
+                i1 = comp;
+                idx = comp;
+                break;
+            }
+        }
+        for(comp = idx-1 ; comp > 0; comp--)
+        {
+            uint16_t tag = get_tag(ip, comp), index = tage_hash(ip, comp); 
+            if(predictor_table[comp-1][index].tag == tag)
+            {
+                i2 = comp;
+                break;
+            }
+        }
+        return;
+    }
+            
+    uint8_t get_prediction(uint64_t ip, int comp, int &ctr)
+    {
+         
+        if(comp == 0) // Check if component is the bimodal table
+        {
+            ctr = 0;
+            // return bimodal_table[bimodal_hash(ip)].to_ulong() >= 2;
+            return bimodal_predict_branch(ip);
+        }
+        else
+        {
+            int prediction = predictor_table[comp-1][tage_hash(ip, comp)].ctr.to_ulong();
+            ctr = abs(int(2 * prediction + 1 - (1 << CTR_BITS)));
+            return prediction >= (1 << (CTR_BITS - 1));
+        }
+    }
+
+    
+    void update(uint64_t ip, uint8_t branch_taken){
+        if(pred_comp > 0) // if not predicted using bimodal
+        {
+            tage_table_entry *entry = &predictor_table[pred_comp-1][tage_hash(ip, pred_comp)];
+            // updating useful bits
+
+            // update use_alt_on_na
+            if(big_ctr <= 1){
+                if(pred != alt_pred)
+                {
+                    if(pred == branch_taken)
+                    {
+                        if(use_alt_on_na > 0)
+                        {
+                            use_alt_on_na--;
+                        }
+                    }
+                    else
+                    {
+                        if(use_alt_on_na < 15)
+                        {
+                            use_alt_on_na++;
+                        }
+                    }
+                }
+            }
+            
+            if(pred != alt_pred)
+            {
+                if(pred == branch_taken){
+                    if(entry->u.to_ulong() < (1 << U_BITS) - 1)
+                    {
+                        entry->u = bitset<U_BITS>(entry->u.to_ulong() + 1);
+                    }
+                }
+                else
+                {
+                    if(entry->u.to_ulong() > 0 && use_alt_on_na < 8)
+                    {
+                        entry->u = bitset<U_BITS>(entry->u.to_ulong() - 1);
+                    }
+                }
+            }
+            // updating ctr bits
+            if(branch_taken && entry->ctr.to_ulong() < ((1 << CTR_BITS) - 1))
+                entry->ctr = bitset<CTR_BITS>(entry->ctr.to_ulong()+1);
+            else if(!branch_taken && entry->ctr.to_ulong() > 0)
+                entry->ctr = bitset<CTR_BITS>(entry->ctr.to_ulong()-1);
+            // branch_taken ? (entry->ctr = bitset<CTR_BITS>(entry->ctr.to_ulong()+1)) : (entry->ctr = bitset<CTR_BITS>(entry->ctr.to_ulong()-1)) ;
+
+            // updating counters for alt_pred and bimodal
+            if(alt_comp > 0)
+            {
+                tage_table_entry alt_entry = predictor_table[alt_comp-1][tage_hash(ip, alt_comp)];
+                if (entry->u.to_ulong() == 0)
+                {
+                    if(branch_taken)
+                    {
+                        if(alt_entry.ctr.to_ulong() < ((1 << CTR_BITS) - 1))
+                        {
+                            predictor_table[alt_comp-1][tage_hash(ip, alt_comp)].ctr = bitset<CTR_BITS>(alt_entry.ctr.to_ulong()+1);
+                        }
+                    }
+                    else
+                    {
+                        if(alt_entry.ctr.to_ulong() > 0)
+                        {
+                            predictor_table[alt_comp-1][tage_hash(ip, alt_comp)].ctr = bitset<CTR_BITS>(alt_entry.ctr.to_ulong()-1);
+                        }     
+                    }
+                }
+
+            }
+            else
+            {
+                if(entry->u.to_ulong() == 0)
+                {
+                    bimodal_last_branch_result(ip,branch_taken);
+                }
+                // bimodal_table[bimodal_hash(ip)] = bitset<2>(branch_taken ? bimodal_table[bimodal_hash(ip)].to_ulong() + 1 : bimodal_table[bimodal_hash(ip)].to_ulong() - 1);
+            }
+            
+
+        }
+        else{
+            // update_counter(bimodal_table[bimodal_hash(ip)], branch_taken, 0, 1);
+            // (branch_taken && bimodal_table[bimodal_hash(ip)].to_ulong() < 1) ? (bimodal_table[bimodal_hash(ip)] = bitset<2>(bimodal_table[bimodal_hash(ip)].to_ulong()+1)) : ((!branch_taken && bimodal_table[bimodal_hash(ip)].to_ulong() > 0) ? (bimodal_table[bimodal_hash(ip)] = bitset<2>(bimodal_table[bimodal_hash(ip)].to_ulong()-1)) : bimodal_table[bimodal_hash(ip)]);
+            bimodal_last_branch_result(ip,branch_taken);
+        }
+
+        // fix stuff on misprediction
+        if(final_pred != branch_taken){
+            long rand = random();
+            rand = rand & ((1 << (NUM_COMPONENTS - pred_comp - 1)) - 1);  
+            int start_component = pred_comp +1 ;
+
+            //compute the start-component for search
+            if (rand & 1)  // 0.5 probability
+            {
+                start_component++;
+                if (rand & 2)  // 0.25 probability
+                    start_component++;
+            }
+
+            //Allocate atleast one entry if no free entry
+            int isFree = 0;
+            for (int i = pred_comp+1; i <= NUM_COMPONENTS; i++)
+            {
+                tage_table_entry *entry_new = &predictor_table[i-1][tage_hash(ip, i)];
+                if ((entry_new->u).to_ulong() == 0)
+                    isFree = 1;
+            }
+            if (!isFree && start_component <= NUM_COMPONENTS){
+                predictor_table[start_component - 1][tage_hash(ip, start_component)].u = bitset<U_BITS>(0);
+            }
+            // search for entry to steal from the start-component till end
+            for (int i = start_component; i <= NUM_COMPONENTS; i++)
+            {
+                tage_table_entry *entry_new = &predictor_table[i-1][tage_hash(ip, i)];
+                if (entry_new->u.to_ulong() == 0)
+                {
+                    // const int temp = TAG_BITS[i];
+                    entry_new->tag = bitset<MAX_TAG_SIZE>(get_tag(ip, i));
+                    entry_new->ctr = bitset<CTR_BITS>(1 << (CTR_BITS - 1));
+                    break;
+                }
+            }
+        }
+        
+        // update global history
+        branch_history_vector = (branch_history_vector << 1);
+        branch_history_vector[0] = branch_taken;
+        // no need of this line as we are using bitset
+        // branch_history_vector = branch_history_vector & ((1 << GLOBAL_HISTORY_LENGTH) - 1);
+
+        // update path history
+        path_history = (path_history << 1);
+        path_history[0] = ip & 1;
+        // no need of this line as we are using bitset
+        // path_history = path_history & ((1 << PATH_HISTORY_LENGTH) - 1);
+
+        // graceful resetting of useful counter
+        branches++;
+        if (branches % RESET_U_BITS == 0)
+        {
+            branches = 0;
+            for (int i = 0; i < NUM_COMPONENTS; i++)
+            {
+                for (int j = 0; j < (1 << INDEX_BITS[i]); j++)
+                    predictor_table[i][j].u >>= 1;
+            }
+        }
+    }
+    
+    uint8_t tage_predict(uint64_t ip){
+        match_component(ip, pred_comp, alt_comp);
+        int alt_ctr;
+        pred = get_prediction(ip, pred_comp, big_ctr); 
+        alt_pred = get_prediction(ip, alt_comp, alt_ctr);
+        
+        if(pred_comp == 0)
+        {
+            final_pred = pred;
+        }
+        else
+        {
+            if (use_alt_on_na < 8 || big_ctr > 1) // Use provider component only if USE_ALT_ON_NA < 8 or the provider counter is strong
+            {
+                final_pred = pred;
+            }
+            else // Else use alternate component
+            {
+                final_pred = alt_pred;
+            }
+        }
+        final_tage_pred = final_pred;
+        return final_pred;
+    }
+    
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // LOOP PREDICTOR
+    // 4-way set associative loop predictor
+    // Only used if high confidence
+
+    loop_table_entry loop_table[LOOP_TABLE_SIZE];
+
+    bool loop_pred = false;
+    bool loop_valid = false;
+    uint64_t loop_tag;
+    uint64_t loop_index;
+    int hit_way = -1;
+    uint8_t final_loop_pred;
+
+    void loop_init()
+    {
+        for(int i = 0; i < LOOP_TABLE_SIZE; i++)
+        {
+            loop_table[i].tag = bitset<LOOP_TAG_SIZE>(0);
+            loop_table[i].past_iter = bitset<LOOP_ITER_SIZE>(0);
+            loop_table[i].current_iter = bitset<LOOP_ITER_SIZE>(0);
+            loop_table[i].age = bitset<LOOP_AGE_BITS>(0);
+            loop_table[i].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
+            loop_table[i].pred = bitset<1>(0);
+        }
+    }
+
+    uint64_t loop_index_hash(uint64_t ip)
+    {
+        return ((ip & ((1 << (LOG_LOOP_TABLE_SIZE - LOG_LOOP_WAY))-1)) << LOG_LOOP_WAY) ;
+    }
+
+    uint64_t loop_tag_hash(uint64_t ip)
+    {
+        uint64_t tag = (ip >> (LOG_LOOP_TABLE_SIZE - LOG_LOOP_WAY)) & ((1 << 2 * LOOP_TAG_SIZE) - 1);
+        tag ^= (tag >> LOOP_TAG_SIZE);
+        tag = (tag & ((1 << LOOP_TAG_SIZE) - 1));
+        return tag;
+    }
+
+    uint8_t loop_predict(uint64_t ip)
+    {
+        loop_index = loop_index_hash(ip);
+        loop_tag = loop_tag_hash(ip);
+        hit_way = -1;
+        for (int i = 0; i < LOOP_WAY; i++)
+        {
+            if (loop_table[loop_index + i].tag.to_ulong() == loop_tag)
+            {
+                hit_way = i;
+                loop_valid = ((loop_table[loop_index + i].confidence.to_ulong() == LOOP_MAX_CONFIDENCE) || loop_table[loop_index + i].past_iter.to_ulong() > 32);
+
+                if (loop_table[loop_index + i].current_iter.to_ulong() + 1 == loop_table[loop_index + i].past_iter.to_ulong())
+                {
+                    loop_pred = loop_table[loop_index + i].pred.flip().to_ulong();
+                    final_loop_pred = loop_pred;
+                    return loop_table[loop_index + i].pred.flip().to_ulong();
+                }
+                else
+                {
+                    loop_pred = loop_table[loop_index + i].pred.to_ulong();
+                    final_loop_pred = loop_pred;
+                    return loop_table[loop_index + i].pred.to_ulong();
+                }
+            }
+        }
+
+        loop_valid = false;
+        loop_pred = false;
+        final_loop_pred = loop_pred;
+        return false;
+    }
+
+    void update_loop_entries(uint64_t ip, bool taken, bool tage_pred)
+    {
+        if (hit_way >=0)
+        {
+            loop_index = loop_index_hash(ip) + hit_way;
+            if (loop_valid)
+            {
+                if (taken != loop_pred)
+                {
+                    // Remove entry
+                    loop_table[loop_index].tag = bitset<LOOP_TAG_SIZE>(0);
+                    loop_table[loop_index].past_iter = bitset<LOOP_ITER_SIZE>(0);
+                    loop_table[loop_index].current_iter = bitset<LOOP_ITER_SIZE>(0);
+                    loop_table[loop_index].age = bitset<LOOP_AGE_BITS>(0);
+                    loop_table[loop_index].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
+                    loop_table[loop_index].pred = bitset<1>(0);
+                    return;
+                }
+                else if (loop_pred != tage_pred)
+                {
+                    if (loop_table[loop_index].age.to_ulong() < LOOP_MAX_AGE)
+                    {
+                        loop_table[loop_index].age = bitset<LOOP_AGE_BITS>(loop_table[loop_index].age.to_ulong() + 1);
+                    }
+                }
+            }
+            
+            loop_table[loop_index].current_iter = bitset<LOOP_ITER_SIZE>((loop_table[loop_index].current_iter.to_ulong() + 1) & ((1<< MAX_LOOP_ITER) - 1));
+
+            if (loop_table[loop_index].current_iter.to_ulong() > loop_table[loop_index].past_iter.to_ulong())
+            {
+                loop_table[loop_index].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
+                loop_table[loop_index].past_iter = bitset<LOOP_ITER_SIZE>(0);
+            }
+
+            if (taken != loop_table[loop_index].pred.to_ulong())
+            {
+                if (loop_table[loop_index].current_iter.to_ulong() == loop_table[loop_index].past_iter.to_ulong())
+                {
+                    if (loop_table[loop_index].confidence.to_ulong() < LOOP_MAX_CONFIDENCE)
+                    {
+                        loop_table[loop_index].confidence = bitset<LOOP_CONFIDENCE_BITS>(loop_table[loop_index].confidence.to_ulong() + 1);
+                    }
+                    if (loop_table[loop_index].past_iter.to_ulong() < 3)
+                    {
+                        loop_table[loop_index].past_iter = bitset<LOOP_ITER_SIZE>(0);
+                        loop_table[loop_index].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
+                        loop_table[loop_index].age = bitset<LOOP_AGE_BITS>(0);
+                        loop_table[loop_index].pred = bitset<1>(taken);
+                    }
+                }
+                else
+                {
+                    if (loop_table[loop_index].past_iter.to_ulong() == 0)
+                    {
+                        loop_table[loop_index].past_iter = bitset<LOOP_ITER_SIZE>(loop_table[loop_index].current_iter.to_ulong());
+                        loop_table[loop_index].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
+                    }
+                    else
+                    {
+                        loop_table[loop_index].past_iter = bitset<LOOP_ITER_SIZE>(0);
+                        loop_table[loop_index].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
+                    }
+
+                    loop_table[loop_index].current_iter = bitset<LOOP_ITER_SIZE>(0);
+                }
+            }
+        }
+        else if (taken)
+        {
+            loop_index = loop_index_hash(ip);
+            loop_tag = loop_tag_hash(ip);
+            for (int i = 0; i < LOOP_WAY; i++)
+            {
+                if (loop_table[loop_index + i].age.to_ulong() == 0)
+                {
+                    loop_table[loop_index + i].tag = bitset<LOOP_TAG_SIZE>(loop_tag);
+                    loop_table[loop_index + i].past_iter = bitset<LOOP_ITER_SIZE>(0);
+                    loop_table[loop_index + i].current_iter = bitset<LOOP_ITER_SIZE>(1);
+                    loop_table[loop_index + i].age = bitset<LOOP_AGE_BITS>(255);
+                    loop_table[loop_index + i].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
+                    loop_table[loop_index + i].pred = bitset<1>(0);
+                    return;
+                }
+                else
+                {
+                    loop_table[loop_index + i].age = bitset<LOOP_AGE_BITS>(loop_table[loop_index + i].age.to_ulong() - 1);
+                }
+            }
+        }        
+    }
+    
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    void init()
+    { 
+        bimodal_init();
+        tage_init();
+        loop_init();
+    }
+    
+    
+};
+
+TAGE_PREDICTOR tage_predictors[NUM_CPUS];
+bitset<WITHLOOP_BITS> predictor_choice[NUM_CPUS];
+
+void O3_CPU::initialize_branch_predictor()
+{
+    tage_predictors[cpu].init();
+    for (int i = 0; i < NUM_CPUS; i++)
+    {
+        predictor_choice[i] = bitset<WITHLOOP_BITS>((1 << (WITHLOOP_BITS - 1)) - 1);
+    }
+}
+
+uint8_t O3_CPU::predict_branch(uint64_t ip)
+{
+    bool tage_prediction = tage_predictors[cpu].tage_predict(ip);
+    bool loop_prediction = tage_predictors[cpu].loop_predict(ip);
+    if (tage_predictors[cpu].loop_valid && predictor_choice[cpu][WITHLOOP_BITS - 1] == 1)
+    {
+        cout << "loop prediction" << endl;
+        return loop_prediction;
+    }
+    else
+    {
+        return tage_prediction;
+    }
+}
+
+void O3_CPU::last_branch_result(uint64_t ip, uint8_t taken)
+{
+    uint8_t tage_prediction = tage_predictors[cpu].final_tage_pred;
+    uint8_t loop_prediction = tage_predictors[cpu].final_loop_pred;
+    tage_predictors[cpu].update(ip, taken);
+    tage_predictors[cpu].update_loop_entries(ip, taken, tage_prediction);
+    if (tage_predictors[cpu].loop_valid && (tage_prediction != loop_prediction))
+    {
+        if (taken == tage_prediction)
+        {
+            if (predictor_choice[cpu].to_ulong() > 0)
+            {
+                predictor_choice[cpu] = bitset<WITHLOOP_BITS>(predictor_choice[cpu].to_ulong() - 1);
+            }
+        }
+        else
+        {
+            if (predictor_choice[cpu].to_ulong() < ((1 << WITHLOOP_BITS) - 1))
+            {
+                predictor_choice[cpu] = bitset<WITHLOOP_BITS>(predictor_choice[cpu].to_ulong() + 1);
+            }
+        }
+    }
+}
