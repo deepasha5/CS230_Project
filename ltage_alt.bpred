@@ -70,19 +70,22 @@ class TAGE_PREDICTOR
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     //BASE BIMODAL PREDICTOR
+
+    // Table to store the entries
     bitset<2> bimodal_table[BIMODAL_TABLE_SIZE];
     
+    // initializing the bimodal table
     void bimodal_init()
     {
         for(int i = 0; i < BIMODAL_TABLE_SIZE; i++){
-            bimodal_table[i] = bitset<2>(2);
+            bimodal_table[i] = bitset<2>(2); // start with weakly taken
         }
     }
     
     // hashing into the bimodal table
     uint64_t bimodal_hash(uint64_t ip)
     {
-        return ip % BIMODAL_PRIME;
+        return ip % BIMODAL_PRIME; // simple hashing function
     }
     
     
@@ -90,7 +93,7 @@ class TAGE_PREDICTOR
     bool bimodal_predict_branch(uint64_t ip)
     {
         uint64_t hash = bimodal_hash(ip);
-        bool prediction = (bimodal_table[hash][1] == 1) ? 1 : 0;
+        bool prediction = (bimodal_table[hash][1] == 1) ? 1 : 0; // if the MSB is 1, predict taken else predict not taken
 
         return prediction;
     }
@@ -103,10 +106,11 @@ class TAGE_PREDICTOR
         // Conversion from bitset to int
         uint64_t bit_value = bimodal_table[hash].to_ulong();
 
+        // Updating the bimodal table
         if (taken && (bit_value < 3))
-            bimodal_table[hash] = bitset<2>(bit_value + 1);
+            bimodal_table[hash] = bitset<2>(bit_value + 1); // if taken and not strongly taken, increment the counter
         else if ((taken == 0) && (bit_value > 0))
-            bimodal_table[hash] = bitset<2>(bit_value - 1); 
+            bimodal_table[hash] = bitset<2>(bit_value - 1);  // if not taken and not strongly not taken, decrement the counter
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -420,15 +424,17 @@ class TAGE_PREDICTOR
     // 4-way set associative loop predictor
     // Only used if high confidence
 
+    // loop predictor table 
     loop_table_entry loop_table[LOOP_TABLE_SIZE];
 
-    bool loop_pred = false;
-    bool loop_valid = false;
-    uint64_t loop_tag;
-    uint64_t loop_index;
-    int hit_way = -1;
-    uint8_t final_loop_pred;
+    bool loop_pred = false; // loop predictor prediction
+    bool loop_valid = false; // To check if loop predictor is valid
+    uint64_t loop_tag; // loop predictor tag
+    uint64_t loop_index; // loop predictor index
+    int hit_way = -1; // way in which loop predictor is hit
+    uint8_t final_loop_pred; // final loop predictor prediction
 
+    // initialize loop predictor table
     void loop_init()
     {
         for(int i = 0; i < LOOP_TABLE_SIZE; i++)
@@ -442,11 +448,13 @@ class TAGE_PREDICTOR
         }
     }
 
+    // Function to get index of loop predictor table
     uint64_t loop_index_hash(uint64_t ip)
     {
-        return ((ip & ((1 << (LOG_LOOP_TABLE_SIZE - LOG_LOOP_WAY))-1)) << LOG_LOOP_WAY) ;
+        return ((ip & ((1 << (LOG_LOOP_TABLE_SIZE - LOG_LOOP_WAY))-1)) << LOG_LOOP_WAY) ; // Simple hash function keeping the lower bits to 0
     }
 
+    // Function to get tag of loop predictor table
     uint64_t loop_tag_hash(uint64_t ip)
     {
         uint64_t tag = (ip >> (LOG_LOOP_TABLE_SIZE - LOG_LOOP_WAY)) & ((1 << 2 * LOOP_TAG_SIZE) - 1);
@@ -455,6 +463,7 @@ class TAGE_PREDICTOR
         return tag;
     }
 
+    // Function to get loop predictor prediction
     uint8_t loop_predict(uint64_t ip)
     {
         loop_index = loop_index_hash(ip);
@@ -462,11 +471,13 @@ class TAGE_PREDICTOR
         hit_way = -1;
         for (int i = 0; i < LOOP_WAY; i++)
         {
-            if (loop_table[loop_index + i].tag.to_ulong() == loop_tag)
+            if (loop_table[loop_index + i].tag.to_ulong() == loop_tag) // Hit
             {
                 hit_way = i;
-                loop_valid = ((loop_table[loop_index + i].confidence.to_ulong() == LOOP_MAX_CONFIDENCE) || loop_table[loop_index + i].past_iter.to_ulong() > 32);
+                // loop predictor is valid if confidence is high or past iterations is greater than 32
+                loop_valid = ((loop_table[loop_index + i].confidence.to_ulong() == LOOP_MAX_CONFIDENCE) || loop_table[loop_index + i].past_iter.to_ulong() > 32); 
 
+                // Get the prediction from loop predictor table
                 if (loop_table[loop_index + i].current_iter.to_ulong() + 1 == loop_table[loop_index + i].past_iter.to_ulong())
                 {
                     loop_pred = loop_table[loop_index + i].pred.flip().to_ulong();
@@ -482,19 +493,22 @@ class TAGE_PREDICTOR
             }
         }
 
+        // If there is a miss, then loop predictor is invalid
         loop_valid = false;
         loop_pred = false;
         final_loop_pred = loop_pred;
         return false;
     }
 
+    // Function to update loop predictor table
     void update_loop_entries(uint64_t ip, bool taken, bool tage_pred)
     {
         if (hit_way >=0)
-        {
-            loop_index = loop_index_hash(ip) + hit_way;
-            if (loop_valid)
+        { 
+            loop_index = loop_index_hash(ip) + hit_way; // Get the index of loop predictor table
+            if (loop_valid) 
             {
+                // If loop valib but mispredicted, then remove entry
                 if (taken != loop_pred)
                 {
                     // Remove entry
@@ -508,6 +522,7 @@ class TAGE_PREDICTOR
                 }
                 else if (loop_pred != tage_pred)
                 {
+                    // If loop predictor and tage predictor disagree, then update age
                     if (loop_table[loop_index].age.to_ulong() < LOOP_MAX_AGE)
                     {
                         loop_table[loop_index].age = bitset<LOOP_AGE_BITS>(loop_table[loop_index].age.to_ulong() + 1);
@@ -515,8 +530,10 @@ class TAGE_PREDICTOR
                 }
             }
             
+            // Increase the number of iterations
             loop_table[loop_index].current_iter = bitset<LOOP_ITER_SIZE>((loop_table[loop_index].current_iter.to_ulong() + 1) & ((1<< MAX_LOOP_ITER) - 1));
 
+            // If current iteration is greater than past iteration, then update past iteration
             if (loop_table[loop_index].current_iter.to_ulong() > loop_table[loop_index].past_iter.to_ulong())
             {
                 loop_table[loop_index].confidence = bitset<LOOP_CONFIDENCE_BITS>(0);
@@ -582,6 +599,7 @@ class TAGE_PREDICTOR
     
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+    // Initialize 
     void init()
     { 
         bimodal_init();
@@ -592,7 +610,11 @@ class TAGE_PREDICTOR
     
 };
 
+
+// Make a global array of tage predictors
 TAGE_PREDICTOR tage_predictors[NUM_CPUS];
+
+// Array to store the choice of predictor
 bitset<WITHLOOP_BITS> predictor_choice[NUM_CPUS];
 
 void O3_CPU::initialize_branch_predictor()
@@ -600,7 +622,7 @@ void O3_CPU::initialize_branch_predictor()
     tage_predictors[cpu].init();
     for (int i = 0; i < NUM_CPUS; i++)
     {
-        predictor_choice[i] = bitset<WITHLOOP_BITS>((1 << (WITHLOOP_BITS - 1)) - 1);
+        predictor_choice[i] = bitset<WITHLOOP_BITS>((1 << (WITHLOOP_BITS - 1)) - 1); // Initialize to slightly favor tage
     }
 }
 
@@ -608,7 +630,8 @@ uint8_t O3_CPU::predict_branch(uint64_t ip)
 {
     bool tage_prediction = tage_predictors[cpu].tage_predict(ip);
     bool loop_prediction = tage_predictors[cpu].loop_predict(ip);
-    if (tage_predictors[cpu].loop_valid && predictor_choice[cpu][WITHLOOP_BITS - 1] == 1)
+
+    if (tage_predictors[cpu].loop_valid && predictor_choice[cpu][WITHLOOP_BITS - 1] == 1) // If loop predictor is valid and loop predictor is chosen
     {
         cout << "loop prediction" << endl;
         return loop_prediction;
@@ -625,13 +648,13 @@ void O3_CPU::last_branch_result(uint64_t ip, uint8_t taken)
     uint8_t loop_prediction = tage_predictors[cpu].final_loop_pred;
     tage_predictors[cpu].update(ip, taken);
     tage_predictors[cpu].update_loop_entries(ip, taken, tage_prediction);
-    if (tage_predictors[cpu].loop_valid && (tage_prediction != loop_prediction))
+    if (tage_predictors[cpu].loop_valid && (tage_prediction != loop_prediction)) // Update score of predictor choice
     {
-        if (taken == tage_prediction)
+        if (taken == tage_prediction) // If tage was correct
         {
-            if (predictor_choice[cpu].to_ulong() > 0)
+            if (predictor_choice[cpu].to_ulong() > 0) 
             {
-                predictor_choice[cpu] = bitset<WITHLOOP_BITS>(predictor_choice[cpu].to_ulong() - 1);
+                predictor_choice[cpu] = bitset<WITHLOOP_BITS>(predictor_choice[cpu].to_ulong() - 1); 
             }
         }
         else
