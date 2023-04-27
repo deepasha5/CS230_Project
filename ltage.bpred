@@ -6,36 +6,37 @@
 #define BIMODAL_PRIME 16381
 
 // TAGE Predictor Parameters
-#define GLOBAL_HISTORY_LENGTH 2048
+#define GLOBAL_HISTORY_LENGTH 1024
 #define PATH_HISTORY_LENGTH 16
 #define MINIMUM_HISTORY_LENGTH 4
-#define HISTORY_ALPHA 2
+#define HISTORY_ALPHA 1.6
 #define MAX_TAG_SIZE 16
 #define MAX_INDEX_BITS 16
-#define NUM_COMPONENTS 13
-#define CTR_BITS 6
-#define U_BITS 3
+#define NUM_COMPONENTS 12
+#define CTR_BITS 3
+#define U_BITS 2
 #define RESET_U_BITS 256000
 
 // Loop Predictor Parameters
-#define LOOP_TABLE_SIZE 512
-#define LOG_LOOP_TABLE_SIZE 9
+#define LOOP_TABLE_SIZE 256
+#define LOG_LOOP_TABLE_SIZE 8
 #define LOOP_WAY 4
 #define LOG_LOOP_WAY 2
 #define LOOP_ITER_SIZE 14
 #define LOOP_TAG_SIZE 14
 #define LOOP_AGE_BITS 7
-#define LOOP_MAX_AGE 127
-#define LOOP_CONFIDENCE_BITS 1
-#define LOOP_MAX_CONFIDENCE 1
+#define LOOP_MAX_AGE 255
+#define LOOP_CONFIDENCE_BITS 2
+#define LOOP_MAX_CONFIDENCE 3
 #define MAX_LOOP_ITER 10
 
 // L-TAGE Predictor Constants
-#define WITHLOOP_BITS 5
+#define WITHLOOP_BITS 7
 
 
-const uint8_t INDEX_BITS[NUM_COMPONENTS] = {10, 10, 11, 11, 11, 10, 10, 10, 10, 11,11, 12,12};
-const uint8_t TAG_BITS[NUM_COMPONENTS] = {7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 15, 16};	
+const uint8_t INDEX_BITS[NUM_COMPONENTS] = {10, 10, 11, 11, 11, 10, 10, 10, 10, 11,11, 12};
+
+const uint8_t TAG_BITS[NUM_COMPONENTS] = {7, 7, 8, 9, 9, 10, 11, 11,11,12, 12, 13};	
 
 // One entry in the tage predictor table
 struct tage_table_entry
@@ -475,7 +476,7 @@ class TAGE_PREDICTOR
             {
                 hit_way = i;
                 // loop predictor is valid if confidence is high or past iterations is greater than 32
-                loop_valid = ((loop_table[loop_index + i].confidence.to_ulong() == LOOP_MAX_CONFIDENCE) || loop_table[loop_index + i].past_iter.to_ulong() > 32); 
+                loop_valid = ((loop_table[loop_index + i].confidence.to_ulong() == LOOP_MAX_CONFIDENCE) || loop_table[loop_index + i].past_iter.to_ulong() > 16); 
 
                 // Get the prediction from loop predictor table
                 if (loop_table[loop_index + i].current_iter.to_ulong() + 1 == loop_table[loop_index + i].past_iter.to_ulong())
