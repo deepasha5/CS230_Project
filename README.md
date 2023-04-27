@@ -7,10 +7,10 @@ We have implemented the L-TAGE predictor and improved it for better prediction i
 
 ## Running Instructions
 The code can be run alongwith champsim, with these commands
-...
+```
 ./build_champsim.sh ltage [l1i_pref] [l1d_pref] [l2c_pref] [llc_pref] [llc_repl] [num_core]
 ./run_champsim.sh ltage-[l1i_pref]-[l1d_pref]-[l2c_pref]-[llc_pref]-[llc_repl]-[num_core] [N_WARM] [N_SIM] [TRACE] [OPTION]
-...
+```
 # References
 1. [The L-TAGE paper](https://www.irisa.fr/caps/people/seznec/L-TAGE.pdf)
 2. The author's submission in CBP2. The code can be found [here](https://team.inria.fr/pacap/members/andre-seznec/branch-prediction-research/)
